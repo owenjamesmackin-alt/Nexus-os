@@ -1,0 +1,310 @@
+#!/bin/bash
+# NEXUS CMD  -  command front-end for NEXUS OS.
+# NEXUS PKG is the package backend (apk underneath: signed packages, dependency solving).
+VERSION="0.1.0"
+STATE="${NEXUS_STATE:-/var/lib/nexus}"
+HIST="$STATE/history.log"
+ETC="${NEXUS_ETC:-/etc/nexus}"
+ALIASES="$ETC/aliases"
+SELF=$(readlink -f "$0")
+ARGS=("$@")
+
+B=$'\e[1;38;5;39m'; P=$'\e[1;38;5;135m'; D=$'\e[2m'; X=$'\e[0m'; E=$'\e[1;31m'; G=$'\e[1;32m'
+say()  { printf '%s\n' "${B}[nexus]${X} $*"; }
+warn() { printf '%s\n' "${P}[nexus]${X} $*" >&2; }
+die()  { printf '%s\n' "${E}[nexus] error:${X} $*" >&2; exit 1; }
+
+need_root() {
+  [ "$(id -u)" -eq 0 ] && return 0
+  command -v doas >/dev/null 2>&1 || die "this command needs root and 'doas' is missing"
+  exec doas "$SELF" "${ARGS[@]}"
+}
+
+log_hist() { mkdir -p "$STATE"; printf '%s\t%s\t%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" "$2" >> "$HIST"; }
+
+banner() {
+  printf '%s\n' "${B} _   _ _____ __  __ _   _ ____${X}" \
+                "${B}| \\ | | ____|\\ \\/ /| | | / ___|${X}" \
+                "${P}|  \\| |  _|   \\  / | | | \\___ \\ ${X}" \
+                "${P}| |\\  | |___  /  \\ | |_| |___) |${X}" \
+                "${P}|_| \\_|_____|/_/\\_\\ \\___/|____/  OS ${D}v$VERSION${X}"
+}
+
+# friendly name -> package list ; returns 1 if the alias is explicitly unavailable
+resolve() {
+  local n="$1" line
+  if [ -f "$ALIASES" ] && line=$(grep -m1 "^${n}=" "$ALIASES"); then
+    line="${line#*=}"
+    [ -n "$line" ] || return 1
+    echo "$line"; return 0
+  fi
+  echo "$n"
+}
+
+cmd_help() {
+  banner
+  cat <<EOF
+
+${B}Packages (NEXUS PKG)${X}
+  nexus install <pkg...>    install software   (nexus install firefox git python)
+  nexus remove <pkg...>     uninstall software
+  nexus update              refresh the package index
+  nexus upgrade             upgrade all installed packages
+  nexus search <text>       search repositories
+  nexus list [--explicit]   installed packages (or only the ones you asked for)
+  nexus info <pkg>          package details
+  nexus repo list|add URL|remove URL
+  nexus history             what was installed / removed / upgraded, and when
+  nexus repair              fix broken installs
+  nexus clean               clear package cache
+  nexus check               health check (disk, /boot, services, updates)
+
+${B}System${X}
+  nexus control             control centre (CPU, RAM, storage, services, network, security)
+  nexus sysinfo             quick system summary
+  nexus resize-disk         grow the root filesystem after enlarging the virtual disk
+  nexus setup               first-boot wizard (password, hostname, disk)
+  nexus desktop on|off      enable / disable desktop auto-start on tty1
+  nexus startx              start the desktop now
+  nexus theme ...           themes: list, apply <name>, export, import
+  nexus ai "<request>"      AI assistant (needs ANTHROPIC_API_KEY; asks before running anything)
+  nexus version
+EOF
+}
+
+# ------------------------------------------------------------------ packages
+cmd_install() {
+  need_root
+  [ $# -gt 0 ] || die "usage: nexus install <package...>"
+  apk update -q 2>/dev/null || warn "could not refresh the index (offline?) - using cached data"
+  local a pk rc
+  for a in "$@"; do
+    if [[ "$a" == *.apk && -f "$a" ]]; then
+      warn "'$a' is a local package file. Installing it skips repository signature checks."
+      read -rp "Install it anyway? [y/N] " yn
+      [[ "$yn" =~ ^[Yy]$ ]] || { say "skipped $a"; continue; }
+      apk add --allow-untrusted "$a"; rc=$?
+      log_hist "install-local" "$a (rc=$rc)"; continue
+    fi
+    if ! pk=$(resolve "$a"); then
+      case "$a" in
+        vscode|code) warn "VS Code has no package for NEXUS OS. Try: nexus install geany   (or neovim, micro)" ;;
+        *) warn "no package available for '$a' (try: nexus search $a)" ;;
+      esac
+      continue
+    fi
+    say "installing $pk"
+    # shellcheck disable=SC2086
+    apk add $pk; rc=$?
+    log_hist "install" "$a -> $pk (rc=$rc)"
+  done
+}
+
+cmd_remove() {
+  need_root
+  [ $# -gt 0 ] || die "usage: nexus remove <package...>"
+  local a pk rc
+  for a in "$@"; do
+    pk=$(resolve "$a") || pk="$a"
+    # shellcheck disable=SC2086
+    apk del $pk; rc=$?
+    log_hist "remove" "$a -> $pk (rc=$rc)"
+  done
+}
+
+cmd_update()  { need_root; apk update; log_hist "update" "index refreshed"; }
+cmd_upgrade() { need_root; apk update && apk upgrade --available; log_hist "upgrade" "rc=$?"; }
+
+cmd_search() {
+  [ $# -gt 0 ] || die "usage: nexus search <text>"
+  local q="$*" out
+  out=$( { apk search -v "$q"; apk search -v -d "$q"; } 2>/dev/null | sort -u )
+  if [ -n "$out" ]; then echo "$out"; else warn "no results (run 'nexus update' if this is a fresh install)"; fi
+}
+
+cmd_list() {
+  if [ "${1:-}" = "--explicit" ]; then cat /etc/apk/world; else apk list -I 2>/dev/null | sort; fi
+}
+
+cmd_info() {
+  [ $# -gt 0 ] || die "usage: nexus info <package>"
+  local pk; pk=$(resolve "$1") || pk="$1"
+  pk=${pk%% *}
+  apk info -a "$pk" 2>/dev/null || apk search -v -e "$pk" || die "unknown package '$1'"
+}
+
+cmd_repo() {
+  local sub="${1:-list}"; [ $# -gt 0 ] && shift
+  case "$sub" in
+    list) cat /etc/apk/repositories ;;
+    add)
+      need_root
+      [[ "${1:-}" =~ ^https?://[^[:space:]]+$ ]] || die "usage: nexus repo add https://host/path"
+      grep -qxF "$1" /etc/apk/repositories || echo "$1" >> /etc/apk/repositories
+      log_hist "repo-add" "$1"
+      say "added. Third-party repositories need their signing key in /etc/apk/keys."
+      apk update ;;
+    remove)
+      need_root
+      [ -n "${1:-}" ] || die "usage: nexus repo remove URL"
+      grep -vxF "$1" /etc/apk/repositories > /etc/apk/repositories.new && mv /etc/apk/repositories.new /etc/apk/repositories
+      log_hist "repo-remove" "$1" ;;
+    *) die "usage: nexus repo list|add URL|remove URL" ;;
+  esac
+}
+
+cmd_history() { [ -f "$HIST" ] && tail -n "${1:-40}" "$HIST" || say "no history yet"; }
+cmd_repair()  { need_root; apk fix; log_hist "repair" "rc=$?"; }
+cmd_clean()   { need_root; apk cache clean 2>/dev/null; rm -f /var/cache/apk/*.apk; log_hist "clean" "cache cleared"; say "package cache cleared"; }
+
+cmd_check() {
+  say "disk";            df -h / /boot 2>/dev/null
+  say "/boot mounted?";  if grep -q ' /boot ' /proc/mounts; then echo "  yes"; else warn "  NO - kernel updates would not reach the boot partition. Run: mount /boot"; fi
+  say "failed services"; rc-status --crashed 2>/dev/null || true
+  say "upgradable packages"
+  local n; n=$(apk list -u 2>/dev/null | wc -l); echo "  $n (run 'nexus update' first for fresh data)"
+  say "package database"; apk fix --simulate 2>&1 | tail -n 3
+}
+
+# ------------------------------------------------------------------ system
+cmd_sysinfo() {
+  banner; echo
+  echo "Kernel   : $(uname -sr) ($(uname -m))"
+  echo "Uptime   : $(uptime | sed 's/^ *//')"
+  echo "CPU      : $(grep -m1 -E 'model name|Model' /proc/cpuinfo 2>/dev/null | cut -d: -f2- | sed 's/^ //') x$(nproc)"
+  free -m 2>/dev/null | awk 'NR==2{printf "Memory   : %s MiB used / %s MiB\n",$3,$2}'
+  df -h / | awk 'NR==2{printf "Storage  : %s used / %s (%s)\n",$3,$2,$5}'
+  echo "Network  : $(ip -4 -o addr show scope global 2>/dev/null | awk '{print $2": "$4}' | paste -sd' ' -)"
+  echo "Theme    : $(nexus-theme current 2>/dev/null)"
+}
+
+cmd_resize() {
+  need_root
+  command -v growpart >/dev/null && command -v resize2fs >/dev/null && command -v sgdisk >/dev/null \
+    || die "needs: cloud-utils-growpart e2fsprogs-extra sgdisk (nexus install those)"
+  local uuid dev disk part
+  uuid=$(sed -n 's/.*root=UUID=\([^ ]*\).*/\1/p' /proc/cmdline)
+  if [ -n "$uuid" ]; then dev=$(findfs "UUID=$uuid"); else dev=$(awk '$2=="/"{d=$1} END{print d}' /proc/mounts); fi
+  [ -b "$dev" ] || die "cannot find the root device"
+  disk=$(echo "$dev" | sed -E 's/p?[0-9]+$//')
+  part=${dev#"$disk"}; part=${part#p}
+  say "root is $dev  (disk $disk, partition $part)"
+  sgdisk -e "$disk" >/dev/null 2>&1 || true
+  growpart "$disk" "$part" || say "partition already fills the disk"
+  resize2fs "$dev"
+  df -h /
+}
+
+cmd_setup() {
+  [ -t 0 ] || return 0
+  local first=0 yn h
+  [ "${1:-}" = "--first-boot" ] && first=1
+  clear; banner; echo
+  echo "Welcome to NEXUS OS. Quick setup (press Enter to skip any step)."; echo
+  read -rp "Change the password for '$USER' now? [Y/n] " yn
+  [[ "$yn" =~ ^[Nn]$ ]] || passwd
+  read -rp "Hostname [$(hostname)]: " h
+  if [[ "$h" =~ ^[A-Za-z0-9][A-Za-z0-9-]{0,62}$ ]]; then
+    printf '%s\n' "$h" | doas tee /etc/hostname >/dev/null && doas hostname "$h" && say "hostname set to $h"
+  fi
+  read -rp "Grow the root filesystem to fill the virtual disk? [y/N] " yn
+  [[ "$yn" =~ ^[Yy]$ ]] && "$SELF" resize-disk
+  doas mkdir -p "$STATE" && doas touch "$STATE/firstboot-done"
+  [ "$first" = 1 ] && { echo; read -rp "Press Enter to continue..." _; }
+  return 0
+}
+
+cmd_desktop() {
+  need_root
+  case "${1:-}" in
+    on)  rm -f "$ETC/nodesktop"; say "desktop will auto-start on tty1" ;;
+    off) touch "$ETC/nodesktop"; say "desktop auto-start disabled (run 'startx' manually)" ;;
+    *)   if [ -e "$ETC/nodesktop" ]; then echo "off"; else echo "on"; fi ;;
+  esac
+}
+
+cmd_control() {
+  local c
+  while true; do
+    clear; banner; echo
+    cat <<EOF
+  ${B}NEXUS Control Centre${X}
+   1) System overview        (CPU / RAM / storage / network)
+   2) Processes              (htop)
+   3) Services               (OpenRC status)
+   4) Network                (addresses, routes, listening ports)
+   5) Packages               (check + upgrade)
+   6) Security               (users, sudo rules, open ports)
+   7) Hardware               (PCI / USB)
+   8) Disk                   (grow root filesystem)
+   9) Appearance             (themes)
+   0) Exit
+EOF
+    read -rp "  > " c
+    clear
+    case "$c" in
+      1) cmd_sysinfo ;;
+      2) if command -v htop >/dev/null; then htop; else top; fi ;;
+      3) rc-status -a ;;
+      4) ip -br addr; echo; ip route; echo; ss -tuln ;;
+      5) cmd_check; read -rp "Upgrade now? [y/N] " yn; [[ "$yn" =~ ^[Yy]$ ]] && cmd_upgrade ;;
+      6) echo "Users with login shells:"; awk -F: '$7 ~ /(ba)?sh$/ {print "  "$1" ("$6")"}' /etc/passwd
+         echo; echo "doas rules:"; cat /etc/doas.conf; echo; echo "Listening:"; ss -tuln ;;
+      7) lspci 2>/dev/null || echo "(pciutils not installed)"; echo; lsusb 2>/dev/null || true ;;
+      8) cmd_resize ;;
+      9) nexus-theme list; read -rp "Theme to apply (Enter to skip): " t; [ -n "$t" ] && nexus-theme apply "$t" ;;
+      0|q|"") return 0 ;;
+    esac
+    echo; read -rp "Press Enter to return..." _
+  done
+}
+
+# ------------------------------------------------------------------ AI mode
+cmd_ai() {
+  [ $# -gt 0 ] || die 'usage: nexus ai "how do I ..."'
+  [ -n "${ANTHROPIC_API_KEY:-}" ] || die "set ANTHROPIC_API_KEY first (export ANTHROPIC_API_KEY=...). Needs network."
+  command -v jq >/dev/null && command -v curl >/dev/null || die "needs curl and jq"
+  local model="${NEXUS_AI_MODEL:-claude-sonnet-5-5}" sys body resp text cmd yn
+  sys="You are the assistant built into NEXUS OS, a small Alpine-based Linux. Packages use 'nexus install' (apk underneath); privileged commands use doas, not sudo. Be concise. If a shell command would help, give exactly one command in a fenced block tagged sh. Never claim you ran anything."
+  body=$(jq -n --arg m "$model" --arg s "$sys" --arg p "$*" \
+    '{model:$m,max_tokens:1024,system:$s,messages:[{role:"user",content:$p}]}')
+  resp=$(curl -sS https://api.anthropic.com/v1/messages \
+    -H "x-api-key: $ANTHROPIC_API_KEY" -H "anthropic-version: 2023-06-01" \
+    -H "content-type: application/json" -d "$body") || die "request failed"
+  text=$(printf '%s' "$resp" | jq -r '.content[0].text // .error.message // "no response"')
+  printf '%s\n' "$text"
+  cmd=$(printf '%s\n' "$text" | awk '/^```sh/{f=1;next} /^```/{f=0} f')
+  if [ -n "$cmd" ]; then
+    echo; echo "${P}Suggested command:${X}"; printf '  %s\n' "$cmd"
+    read -rp "Run it? [y/N] " yn
+    [[ "$yn" =~ ^[Yy]$ ]] && bash -c "$cmd"
+  fi
+}
+
+# ------------------------------------------------------------------ dispatch
+sub="${1:-help}"; [ $# -gt 0 ] && shift
+case "$sub" in
+  install|add)         cmd_install "$@" ;;
+  remove|uninstall|rm) cmd_remove "$@" ;;
+  update)              cmd_update ;;
+  upgrade)             cmd_upgrade ;;
+  search)              cmd_search "$@" ;;
+  list|ls)             cmd_list "$@" ;;
+  info)                cmd_info "$@" ;;
+  repo)                cmd_repo "$@" ;;
+  history)             cmd_history "$@" ;;
+  repair)              cmd_repair ;;
+  clean)               cmd_clean ;;
+  check)               cmd_check ;;
+  sysinfo)             cmd_sysinfo ;;
+  resize-disk)         cmd_resize ;;
+  setup)               cmd_setup "$@" ;;
+  desktop)             cmd_desktop "$@" ;;
+  control)             cmd_control ;;
+  theme)               exec nexus-theme "$@" ;;
+  ai)                  cmd_ai "$@" ;;
+  startx)              exec startx -- -nolisten tcp ;;
+  version|--version|-v) echo "NEXUS CMD $VERSION" ;;
+  help|--help|-h)      cmd_help ;;
+  *) die "unknown command '$sub' (try: nexus help)" ;;
+esac
