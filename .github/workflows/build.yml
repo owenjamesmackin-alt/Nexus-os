@@ -1,0 +1,31 @@
+name: Build for UTM SE
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-utm-image:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Build x86_64 Image
+        run: |
+          # Automatically find where build.sh is located in case of upload directory shifting
+          SCRIPT_PATH=$(find . -name "build.sh" | head -n 1)
+          SCRIPT_DIR=$(dirname "$SCRIPT_PATH")
+          cd "$SCRIPT_DIR"
+          chmod +x build.sh
+          chmod +x *.sh
+          if [ -d "inner" ]; then chmod +x inner/*.sh; fi
+          
+          # Run the standard build command 
+          NEXUS_DESKTOP=0 ARCH=x86_64 FORMATS="qcow2" ./build.sh
+
+      - name: Upload to iPad
+        uses: actions/upload-artifact@v4
+        with:
+          name: nexus-os-utm-file
+          path: "**/out/*.qcow2"
