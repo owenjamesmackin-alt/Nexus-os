@@ -1,0 +1,13 @@
+
+ _   _ _____ __  __ _   _ ____
+| \ | | ____|\ \/ /| | | / ___|
+|  \| |  _|   \  / | | | \___ \
+| |\  | |___  /  \ | |_| |___) |
+|_| \_|_____|/_/\_\ \___/|____/   OS  Installer
+
+ Log in as root (no password), then run:
+
+     nexus-install
+
+ It erases the disk you choose and writes NEXUS OS to it (UEFI systems only).
+

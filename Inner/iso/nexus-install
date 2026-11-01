@@ -1,0 +1,58 @@
+#!/bin/bash
+# NEXUS OS installer: writes the NEXUS disk image on this ISO to a target disk.
+set -eu
+[ "$(id -u)" -eq 0 ] || { echo "Run as root"; exit 1; }
+
+case "$(uname -m)" in aarch64) short=arm64 ;; *) short=x86_64 ;; esac
+name="nexus-os-$short.qcow2"
+
+img=$(ls /media/*/nexus/"$name" 2>/dev/null | head -n1 || true)
+if [ -z "$img" ]; then
+  mkdir -p /mnt/iso
+  for d in /dev/sr0 /dev/sr1 /dev/cdrom; do
+    [ -b "$d" ] && mount -o ro "$d" /mnt/iso 2>/dev/null && break
+  done
+  img="/mnt/iso/nexus/$name"
+fi
+[ -f "$img" ] || { echo "Cannot find $name on the install media."; exit 1; }
+
+if [ ! -d /sys/firmware/efi ]; then
+  echo "WARNING: this machine did not boot in UEFI mode. NEXUS OS boots via UEFI only."
+  read -rp "Continue anyway? [y/N] " yn
+  [ "$yn" = y ] || [ "$yn" = Y ] || exit 1
+fi
+
+echo "Available disks:"
+lsblk -dpno NAME,SIZE,MODEL | grep -v -e '/loop' -e '/sr' || true
+echo
+read -rp "Install NEXUS OS to which disk? (e.g. /dev/sda): " dev
+[ -b "$dev" ] || { echo "$dev is not a block device"; exit 1; }
+if grep -q "^$dev" /proc/mounts; then echo "$dev is in use (it may be the install media). Aborting."; exit 1; fi
+
+need=$(qemu-img info --output=json "$img" | jq -r '."virtual-size"')
+have=$(blockdev --getsize64 "$dev")
+[ "$have" -ge "$need" ] || { echo "Disk too small: need $((need/1048576)) MiB, have $((have/1048576)) MiB."; exit 1; }
+
+echo
+echo "!!! EVERYTHING ON $dev WILL BE ERASED !!!"
+read -rp "Type the disk name again to confirm: " c
+[ "$c" = "$dev" ] || { echo "Cancelled."; exit 1; }
+
+echo "Writing NEXUS OS..."
+qemu-img convert -p -f qcow2 -O raw "$img" "$dev"
+sync
+
+echo "Growing to fill the disk..."
+sgdisk -e "$dev" >/dev/null 2>&1 || true
+blockdev --rereadpt "$dev" 2>/dev/null || true
+mdev -s 2>/dev/null || true
+sleep 2
+case "$dev" in *[0-9]) part="${dev}p2" ;; *) part="${dev}2" ;; esac
+growpart "$dev" 2 >/dev/null 2>&1 || true
+mdev -s 2>/dev/null || true
+e2fsck -fy "$part" >/dev/null 2>&1 || true
+resize2fs "$part" >/dev/null 2>&1 || true
+sync
+
+echo
+echo "Done. Remove the install media and reboot. Login: nexus / nexus (change it on first boot)."
