@@ -1,0 +1,6 @@
+#!/bin/sh
+# NEXUS start menu / application launcher (themed dmenu).
+CFG="$HOME/.config/nexus/theme.sh"
+[ -f "$CFG" ] && . "$CFG"
+exec dmenu_run -i -l 10 -p 'NEXUS' -fn 'DejaVu Sans Mono:size=12' \
+  -nb "${BG2:-#0e1124}" -nf "${FG:-#d6e4ff}" -sb "${ACCENT2:-#8a2cff}" -sf '#ffffff'
