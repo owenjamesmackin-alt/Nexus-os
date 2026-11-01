@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=NEXUS Start
+Comment=Application launcher
+Exec=nexus-launcher
+Icon=start-here
+Terminal=false
+Categories=System;

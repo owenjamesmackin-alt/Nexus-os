@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=NEXUS Control Centre
+Exec=xterm -T "NEXUS Control Centre" -e nexus control
+Icon=preferences-system
+Terminal=false
+Categories=System;Settings;
